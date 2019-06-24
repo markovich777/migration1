@@ -1,0 +1,259 @@
+ /*****************************************************************
+** $Header: /Phoenix System/Data Services/Database/StoredProcedure/dev(Phoenix)/ObjectModel/proc_fi_MonitorINPotentialConflictingUpdates.sql $
+**
+** Created By: GerstleL
+** Created on  Wednesday, July 26, 2017
+** All rights reserved, i-Deal, LLC
+**
+** DESCRIPTION 
+**  	This Monitors IN inbound & outbound tables for potential situations where an inbound order over-writes a recent change to the same order made in Phoenix
+** 
+** SAMPLE EXECUTION
+** 	exec dbo.proc_fi_MonitorINPotentialConflictingUpdates
+**
+** $Log: /Phoenix System/Data Services/Database/StoredProcedure/dev(Phoenix)/Others/proc_fi_MonitorINPotentialConflictingUpdates.sql $
+**
+*******************************************************************/
+
+IF EXISTS (SELECT * FROM sysobjects WHERE type = 'P' AND name = 'proc_fi_MonitorINPotentialConflictingUpdates')
+BEGIN
+	PRINT 'Dropping Procedure dbo.proc_fi_MonitorINPotentialConflictingUpdates'
+	DROP  Procedure  proc_fi_MonitorINPotentialConflictingUpdates
+END
+GO
+
+PRINT 'Creating Procedure dbo.proc_fi_MonitorINPotentialConflictingUpdates'
+GO
+
+CREATE Procedure dbo.proc_fi_MonitorINPotentialConflictingUpdates
+As
+BEGIN
+	SET NOCOUNT ON
+
+	declare @yesterday datetime
+	select @yesterday = DATEADD(day, -1, GetUTCDate())
+
+	declare @bhusers table (up_id int primary key, userid varchar(max))
+	insert @bhusers
+		select	up_id, userid
+		from	tbl_user_profile (nolock)
+		where	userid like 'bridgehead@%'
+
+	declare @o table (ord_id int primary key)
+	insert @o
+		select	o.ord_id
+		from	tbl_order o (nolock)
+				inner join tbl_debt_order do (nolock) on do.ord_id = o.ord_id
+		where	last_modified_dt > @yesterday
+
+	declare @ioih table (row_id int, ord_id int, prd_id int, last_modified_dt datetime, userid nvarchar(max), ioi_amt bigint)
+	insert @ioih
+	    select	ROW_NUMBER() over(partition by h.ord_id, ioi_prd_id order by revision_id) as row_id, h.ord_id, h.ioi_prd_id, h.last_modified_dt, up.userid, sum (IsNull (h.ioi_amt, 0))
+		from	@o o
+			inner join tbl_order_ioi_hist h (nolock) on h.ord_id = o.ord_id
+			inner join tbl_user_profile up (nolock) on up.up_id = h.last_modified_up_id
+		where	h.last_modified_dt > DATEADD(day, -1, @yesterday)
+		and		h.action_flg <> 'D'
+		group by h.ord_id, ioi_prd_id, h.revision_id, h.last_modified_dt, up.userid
+
+
+	declare @oph table (row_id int, ord_id int, prd_id int, last_modified_dt datetime, userid nvarchar(max), canceled_ind bit)
+	insert @oph
+	    select	ROW_NUMBER() over(partition by h.ord_id, prd_id order by revision_id) as row_id, h.ord_id, h.prd_id, h.last_modified_dt, up.userid, h.canceled_ind
+		from	@o o
+			inner join tbl_order_product_hist h (nolock) on h.ord_id = o.ord_id
+			inner join tbl_user_profile up (nolock) on up.up_id = h.last_modified_up_id
+		where	h.last_modified_dt > DATEADD(day, -1, @yesterday)
+		and		h.action_flg <> 'D'
+
+	declare @results table (
+			Type				Varchar(100),
+			Container			varchar(25),
+			DealCode			varchar(25) ,
+			DealName			varchar(25), 
+			Tranche				varchar(15),
+			InvestorName		varchar(25), 
+			INOrder				varchar(11), 
+			OrigUser			varchar(25), 
+			OrigTimestamp		varchar(23), 
+			OrigValue			varchar(15), 
+			ModifiedUser		varchar(25), 
+			ModifiedTimestamp	varchar(23), 
+			ModifiedValue		varchar(15), 
+			BHUser				varchar(25), 
+			BHTimestamp			varchar(23), 
+			BHValue				varchar(15) )
+
+	--Idea: Check order history to see if Bridgehead updated qty back to what it was before
+;	with
+		ioi_hist (row_id, ord_id, prd_id, last_modified_dt, userid, ioi)
+		as (
+		    select	row_id, ord_id, prd_id, last_modified_dt, userid, ioi_amt
+			from	@ioih
+		),
+		ioi_current (ord_id, prd_id, ioi)
+		as (
+			select	ioi.ord_id, ioi.ioi_prd_id, sum (IsNull (ioi.ioi_amt, 0))
+			from	@o o
+				inner join tbl_order_ioi ioi (nolock) on ioi.ord_id = o.ord_id
+			group by ioi.ord_id, ioi.ioi_prd_id
+		)
+	insert @results
+		select	'IOI Amount' Type,
+				Convert (varchar(25), cm.legal_nm) Container, 
+				Convert (varchar(25), i.issue_cd) DealCode, 
+				Convert (varchar(25), i.issue_nm) DealName, 
+				Convert (varchar(15), t.trn_nm) Tranche,
+				Convert (varchar(25), ii.name) InvestorName, 
+				Convert (varchar(11), m.ipma_ext_key) INOrder, 
+				Convert (varchar(25), orig.userid) OrigUser, 
+				Convert (varchar(23), orig.last_modified_dt) OrigTimestamp, 
+				Convert (varchar(15), orig.ioi) OrigValue, 
+				Convert (varchar(25), mod.userid) ModifiedUser, 
+				Convert (varchar(23), mod.last_modified_dt) ModifiedTimestamp, 
+				Convert (varchar(15), mod.ioi) ModifiedValue, 
+				Convert (varchar(25), bh.userid) BHUser, 
+				Convert (varchar(23), bh.last_modified_dt) BHTimestamp, 
+				Convert (varchar(15), bh.ioi) BHValue
+		from	@o o
+			inner join tbl_debt_order do (nolock) on do.ord_id = o.ord_id
+			inner join tbl_issue i (nolock) on i.iss_id = do.iss_id
+			inner join tbl_company_master cm (nolock) on cm.mstr_id = i.deal_owner_id
+			inner join tbl_customer c (nolock) on c.mstr_id = cm.mstr_id
+			inner join tbl_order_product op (nolock) on op.ord_id = do.ord_id
+			inner join tbl_institutional_investor ii (nolock) on ii.inst_inv_id = do.inst_inv_id
+			inner join tbl_p2p_mapping m (nolock) on m.local_id = do.ord_id and m.local_id2 = op.prd_id
+			inner join tbl_in_external_order eo (nolock) on eo.external_key = m.ipma_ext_key
+			inner join tbl_in_external_tranche et (nolock) on et.ext_trn_id = eo.ext_trn_id and et.cid = c.cid
+			inner join ioi_hist orig (nolock) on orig.ord_id = do.ord_id and orig.prd_id = op.prd_id
+			inner join ioi_hist mod (nolock) on mod.ord_id = do.ord_id and mod.prd_id = op.prd_id and mod.row_id = orig.row_id + 1 
+			inner join ioi_hist bh (nolock) on bh.ord_id = do.ord_id and bh.prd_id = op.prd_id and bh.row_id = mod.row_id + 1 and DATEDIFF(MILLISECOND, mod.last_modified_dt, bh.last_modified_dt) between 1 and 60000
+			inner join ioi_current curr (nolock) on curr.ord_id = do.ord_id and curr.prd_id = op.prd_id
+			inner join tbl_debt_product dp (nolock) on dp.prd_id = op.prd_id
+			inner join tbl_tranche t (nolock) on t.trn_id = dp.trn_id
+		where	eo.phx_owned_ind = 1 
+		and		op.canceled_ind = 0
+		and		mod.userid not like 'bridgehead@%'
+		and		bh.userid like 'bridgehead@%'
+		and		orig.ioi <> mod.ioi
+		and		orig.ioi = bh.ioi
+		and		bh.ioi = curr.ioi
+		and		bh.last_modified_dt > DateAdd (minute, -32, GetUTCDate())
+
+
+	--Idea: Check order history to see if Bridgehead updated cancel status back to what it was before
+;	with
+		op_hist (row_id, ord_id, prd_id, last_modified_dt, userid, canceled_ind)
+		as (
+		    select	row_id, ord_id, prd_id, last_modified_dt, userid, canceled_ind
+			from	@oph
+		),
+		op_current (ord_id, prd_id, canceled_ind)
+		as (
+			select	op.ord_id, op.prd_id, canceled_ind
+			from	@o o
+				inner join tbl_order_product op (nolock) on op.ord_id = o.ord_id
+		)
+	insert @results
+		select	'Cancel Status',
+				Convert (varchar(25), cm.legal_nm) Container, 
+				Convert (varchar(25), i.issue_cd) DealCode, 
+				Convert (varchar(25), i.issue_nm) DealName, 
+				Convert (varchar(15), t.trn_nm) Tranche,
+				Convert (varchar(25), ii.name) InvestorName, 
+				Convert (varchar(11), m.ipma_ext_key) INOrder, 
+				Convert (varchar(25), orig.userid) OrigUser, 
+				Convert (varchar(23), orig.last_modified_dt) OrigTimestamp, 
+				Convert (varchar(15), orig.canceled_ind) OrigValue, 
+				Convert (varchar(25), mod.userid) ModifiedUser, 
+				Convert (varchar(23), mod.last_modified_dt) ModifiedTimestamp, 
+				Convert (varchar(15), mod.canceled_ind) ModifiedValue, 
+				Convert (varchar(25), bh.userid) BHUser, 
+				Convert (varchar(23), bh.last_modified_dt) BHTimestamp, 
+				Convert (varchar(15), bh.canceled_ind) BHValue
+		from	@o o
+			inner join tbl_debt_order do (nolock) on do.ord_id = o.ord_id
+			inner join tbl_issue i (nolock) on i.iss_id = do.iss_id
+			inner join tbl_company_master cm (nolock) on cm.mstr_id = i.deal_owner_id
+			inner join tbl_customer c (nolock) on c.mstr_id = cm.mstr_id
+			inner join tbl_order_product op (nolock) on op.ord_id = do.ord_id
+			inner join tbl_institutional_investor ii (nolock) on ii.inst_inv_id = do.inst_inv_id
+			inner join tbl_p2p_mapping m (nolock) on m.local_id = do.ord_id and m.local_id2 = op.prd_id
+			inner join tbl_in_external_order eo (nolock) on eo.external_key = m.ipma_ext_key
+			inner join tbl_in_external_tranche et (nolock) on et.ext_trn_id = eo.ext_trn_id and et.cid = c.cid
+			inner join op_hist orig (nolock) on orig.ord_id = do.ord_id and orig.prd_id = op.prd_id
+			inner join op_hist mod (nolock) on mod.ord_id = do.ord_id and mod.prd_id = op.prd_id and mod.row_id = orig.row_id + 1 
+			inner join op_hist bh (nolock) on bh.ord_id = do.ord_id and bh.prd_id = op.prd_id and bh.row_id = mod.row_id + 1 and DATEDIFF(MILLISECOND, mod.last_modified_dt, bh.last_modified_dt) between 1 and 60000
+			inner join op_current curr (nolock) on curr.ord_id = do.ord_id and curr.prd_id = op.prd_id
+			inner join tbl_debt_product dp (nolock) on dp.prd_id = op.prd_id
+			inner join tbl_tranche t (nolock) on t.trn_id = dp.trn_id
+		where	eo.phx_owned_ind = 1 
+		and		op.canceled_ind = 0
+		and		mod.userid not like 'bridgehead@%'
+		and		bh.userid like 'bridgehead@%'
+		and		orig.canceled_ind <> mod.canceled_ind
+		and		orig.canceled_ind = bh.canceled_ind
+		and		bh.canceled_ind = curr.canceled_ind
+		and		bh.last_modified_dt > DateAdd (minute, -32, GetUTCDate())
+
+
+	--Idea: Check order history to see if Bridgehead cancelled an order that is owned by the container that owns the deal (this is accomplished by verifying that the order was created by a non-bridgehead account)
+;	with
+		op_hist (row_id, ord_id, prd_id, last_modified_dt, userid, canceled_ind)
+		as (
+		    select	row_id, ord_id, prd_id, last_modified_dt, userid, canceled_ind
+			from	@oph
+		),
+		op_current (ord_id, prd_id, canceled_ind)
+		as (
+			select	op.ord_id, op.prd_id, canceled_ind
+			from	@o o
+				inner join tbl_order_product op (nolock) on op.ord_id = o.ord_id
+		)
+	insert @results
+		select	'Bridgehead canclled an order owned by the container',
+				Convert (varchar(25), cm.legal_nm) Container, 
+				Convert (varchar(25), i.issue_cd) DealCode, 
+				Convert (varchar(25), i.issue_nm) DealName, 
+				Convert (varchar(15), t.trn_nm) Tranche,
+				Convert (varchar(25), ii.name) InvestorName, 
+				Convert (varchar(11), m.ipma_ext_key) INOrder, 
+				Convert (varchar(25), register_up_id) OrigUser, 
+				Convert (varchar(23), orig.last_modified_dt) OrigTimestamp, 
+				Convert (varchar(15), 0) OrigValue, 
+				Convert (varchar(25), bh.userid) ModifiedUser, 
+				Convert (varchar(23), bh.last_modified_dt) ModifiedTimestamp, 
+				Convert (varchar(15), 1) ModifiedValue, 
+				Convert (varchar(25), bh.userid) BHUser, 
+				Convert (varchar(23), bh.last_modified_dt) BHTimestamp, 
+				Convert (varchar(15), bh.canceled_ind) BHValue
+		from    @o tmpo
+            inner join tbl_order o (nolock) on o.ord_id = tmpo.ord_id
+            inner join tbl_debt_order do (nolock) on do.ord_id = o.ord_id
+            inner join tbl_issue i (nolock) on i.iss_id = do.iss_id
+            inner join tbl_company_master cm (nolock) on cm.mstr_id = i.deal_owner_id
+            inner join tbl_customer c (nolock) on c.mstr_id = cm.mstr_id
+            inner join tbl_order_product op (nolock) on op.ord_id = do.ord_id
+            inner join tbl_institutional_investor ii (nolock) on ii.inst_inv_id = do.inst_inv_id
+            inner join tbl_p2p_mapping m (nolock) on m.local_id = do.ord_id and m.local_id2 = op.prd_id
+            inner join tbl_in_external_order eo (nolock) on eo.external_key = m.ipma_ext_key
+            inner join tbl_in_external_tranche et (nolock) on et.ext_trn_id = eo.ext_trn_id and et.cid = c.cid
+            inner join op_hist orig (nolock) on orig.ord_id = do.ord_id and orig.prd_id = op.prd_id
+            inner join op_hist bh (nolock) on bh.ord_id = do.ord_id and bh.prd_id = op.prd_id and bh.row_id = orig.row_id + 1
+            inner join tbl_debt_product dp (nolock) on dp.prd_id = op.prd_id
+            inner join tbl_tranche t (nolock) on t.trn_id = dp.trn_id
+        where   eo.phx_owned_ind = 1 
+        and     bh.userid like 'bridgehead@%'
+        and     orig.canceled_ind = 0
+        and     bh.canceled_ind = 1
+		and		o.register_up_id not in (select up_id from @bhusers)
+
+	select * from @results order by BHTimestamp
+
+	if @@rowcount > 0
+		raiserror ('There are orders which may have had local canges over-written by IN.', 16, 1)
+END
+GO
+
+GRANT EXEC ON dbo.proc_fi_MonitorINPotentialConflictingUpdates TO public
+GO
